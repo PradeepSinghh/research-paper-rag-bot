@@ -1,21 +1,58 @@
 """
 Configuration module.
 
-Loads all settings from environment variables (via .env) and exposes
-them as typed constants used across the entire codebase.
-Nothing is hardcoded here — all secrets come from the environment.
+Loads all settings safely from:
+1. Streamlit secrets (st.secrets) — for Streamlit Community Cloud
+2. Environment variables — for local development
+3. .env file — for development convenience
+
+Nothing is hardcoded here — all secrets come from external sources.
 """
 
 import os
+from typing import Optional
 from dotenv import load_dotenv
+
+# Try to import streamlit (may not be available in all contexts)
+try:
+    import streamlit as st
+    HAS_STREAMLIT = True
+except ImportError:
+    HAS_STREAMLIT = False
 
 # Load .env file from project root (works whether run from root or a sub-dir)
 load_dotenv()
 
 
+# ─── Helper Function to Safely Retrieve Secrets ────────────────────────────────
+def get_secret(key: str, default: str = "") -> str:
+    """
+    Retrieve a secret value safely from multiple sources in priority order:
+    1. Streamlit secrets (st.secrets) — for Streamlit Community Cloud
+    2. Environment variables (os.getenv) — for local development
+    3. Default value — if neither source has the key
+    
+    Args:
+        key: The secret key to retrieve
+        default: Default value if not found (default: "")
+    
+    Returns:
+        The secret value, or default if not found
+    """
+    # Try Streamlit secrets first (works in Streamlit Cloud)
+    if HAS_STREAMLIT:
+        try:
+            return st.secrets.get(key, default)
+        except (AttributeError, FileNotFoundError):
+            pass
+    
+    # Fall back to environment variables
+    return os.getenv(key, default)
+
+
 # ─── API Keys ──────────────────────────────────────────────────────────────────
-GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
-COHERE_API_KEY: str = os.getenv("COHERE_API_KEY", "")
+GROQ_API_KEY: str = get_secret("GROQ_API_KEY")
+COHERE_API_KEY: str = get_secret("COHERE_API_KEY")
 
 
 # ─── Model Settings ────────────────────────────────────────────────────────────

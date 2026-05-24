@@ -98,18 +98,40 @@ _init_session()
 
 
 def _check_api_keys() -> bool:
+    """
+    Validate that all required API keys are configured.
+    Supports both local development (.env) and Streamlit Cloud (secrets).
+    """
     missing = []
     if not GROQ_API_KEY:
         missing.append("GROQ_API_KEY")
     if not COHERE_API_KEY:
         missing.append("COHERE_API_KEY")
+    
     if missing:
-        st.error(
-            f"**Missing API key(s): {', '.join(missing)}**\n\n"
-            "Copy `.env.example` to `.env` and fill in your keys, then restart."
+        st.error(f"❌ **Missing API key(s): {', '.join(missing)}**")
+        st.info(
+            "### Setup Instructions\n\n"
+            "**For Local Development:**\n"
+            "1. Copy `.env.example` to `.env`\n"
+            "2. Add your API keys to `.env`:\n"
         )
-        st.code("\n".join(f"{k}=your_key_here" for k in missing), language="bash")
-        return False
+        st.code(
+            "\n".join(f"{k}=your_key_here" for k in missing),
+            language="bash"
+        )
+        st.info(
+            "3. Restart Streamlit: `streamlit run app.py`\n\n"
+            "**For Streamlit Community Cloud:**\n"
+            "1. Go to your app's **Settings** → **Secrets**\n"
+            "2. Add each key in TOML format:\n"
+        )
+        st.code(
+            "\n".join(f'{k} = "your_key_here"' for k in missing),
+            language="toml"
+        )
+        st.stop()
+    
     return True
 
 
@@ -831,8 +853,7 @@ def _render_export() -> None:
 def main() -> None:
     _render_sidebar()
 
-    if not _check_api_keys():
-        return
+    _check_api_keys()  # Will call st.stop() if keys are missing
 
     if st.session_state.mode == "chat":
         _render_chat()

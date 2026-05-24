@@ -4,8 +4,13 @@ A production-quality, lightweight Retrieval-Augmented Generation (RAG) chatbot t
 
 **v2 — Trust & Quality Upgrade:** Grounding guardrail · Confidence labels · Source chunk preview · Streaming · Evaluation dashboard · Rerank comparison · Bibliography browser · Sample demo mode.
 
----
+**🚀 Live Demo:** [research-paper-rag-bot-a22s.streamlit.app](https://research-paper-rag-bot-a22src6hgb9g8ekbvb7zhh.streamlit.app)
 
+---
+## Screenshots
+![alt text](image.png)
+
+---
 ## Tech Stack
 
 | Layer | Library |
