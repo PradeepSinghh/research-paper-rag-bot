@@ -1,0 +1,668 @@
+"""
+Research Paper RAG Chatbot — Streamlit Application Entry Point.
+
+Run with:
+    streamlit run app.py
+
+Architecture overview
+---------------------
+Session state holds the shared FAISSVectorStore and all per-session
+data (chat history, loaded papers, settings).  Because Streamlit reruns
+the whole script on every interaction, all expensive objects (the index,
+the paper registry) live in st.session_state so they survive reruns.
+
+The UI is split into:
+  • Sidebar  — upload, paper list, mode toggle, settings, shortcuts, reset.
+  • Chat tab — standard Q&A with citations and source snippets.
+  • Compare  — side-by-side comparison of two papers.
+  • Export   — download chat as Markdown or JSON.
+"""
+
+import json
+import os
+from datetime import datetime
+from typing import Dict, List, Any, Optional
+
+import streamlit as st
+
+from rag.loader import load_pdf
+from rag.chunking import chunk_pages
+from rag.embeddings import embed_documents
+from rag.vectorstore import FAISSVectorStore
+from rag.retriever import retrieve
+from rag.reranker import rerank
+from rag.generator import generate_answer
+from rag.citations import (
+    format_citations,
+    format_source_snippets,
+    build_apa_citation,
+    build_ieee_citation,
+)
+from rag.compare import compare_papers
+from utils.config import (
+    UPLOAD_DIR,
+    INDEX_DIR,
+    GROQ_API_KEY,
+    COHERE_API_KEY,
+    TOP_K_RETRIEVE,
+    TOP_K_RERANK,
+    CHUNK_SIZE,
+    CHUNK_OVERLAP,
+    APP_TITLE,
+)
+from utils.file_utils import save_uploaded_file, get_file_hash, ensure_dir
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Page configuration — must be the first Streamlit call
+# ══════════════════════════════════════════════════════════════════════════════
+st.set_page_config(
+    page_title=APP_TITLE,
+    page_icon="📚",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Session state bootstrap
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _init_session() -> None:
+    """
+    Initialise all session-state keys on the very first script run.
+    Subsequent reruns skip keys that are already set.
+    """
+    defaults: Dict[str, Any] = {
+        "store": FAISSVectorStore(),
+        "messages": [],           # List[{role, content, citations?, snippets?}]
+        "papers": {},             # filename -> {chunks, pages, hash, indexed_at}
+        "processed_hashes": set(),
+        "mode": "chat",           # "chat" | "compare"
+        # Retrieval settings (mirrored from sidebar sliders)
+        "top_k": TOP_K_RETRIEVE,
+        "top_n": TOP_K_RERANK,
+        "chunk_size": CHUNK_SIZE,
+        "chunk_overlap": CHUNK_OVERLAP,
+        "citation_style": "APA",
+    }
+    for key, val in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
+
+
+_init_session()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# API key guard
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _check_api_keys() -> bool:
+    """
+    Verify that both required API keys are configured.
+    Renders an error widget and returns False if any are missing.
+    """
+    missing = []
+    if not GROQ_API_KEY:
+        missing.append("GROQ_API_KEY")
+    if not COHERE_API_KEY:
+        missing.append("COHERE_API_KEY")
+
+    if missing:
+        st.error(
+            f"**Missing API key(s): {', '.join(missing)}**\n\n"
+            "Copy `.env.example` to `.env` and fill in your keys, then restart."
+        )
+        st.code(
+            "\n".join(f"{k}=your_key_here" for k in missing),
+            language="bash",
+        )
+        return False
+    return True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PDF processing pipeline
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _process_pdf(uploaded_file) -> bool:
+    """
+    Run the full ingestion pipeline for one uploaded PDF.
+
+    Steps: save → extract → chunk → embed → index.
+    Skips silently if the same file (by content hash) was already processed.
+
+    Args:
+        uploaded_file: A Streamlit UploadedFile object.
+
+    Returns:
+        True on success or if already indexed, False on error.
+    """
+    file_bytes: bytes = uploaded_file.read()
+    file_hash: str = get_file_hash(file_bytes)
+    filename: str = uploaded_file.name
+
+    # ── Deduplication ──────────────────────────────────────────────────────────
+    if file_hash in st.session_state.processed_hashes:
+        st.info(f"ℹ️ '{filename}' is already indexed — skipping.")
+        return True
+
+    if filename in st.session_state.papers:
+        st.warning(
+            f"⚠️ A file named '{filename}' is already loaded. "
+            "Rename it if this is a different paper."
+        )
+        return False
+
+    # ── Save to disk ───────────────────────────────────────────────────────────
+    ensure_dir(UPLOAD_DIR)
+    file_path = save_uploaded_file(UPLOAD_DIR, file_bytes, filename)
+
+    try:
+        # 1. Extract text
+        with st.spinner(f"📄 Extracting text from **{filename}** …"):
+            pages = load_pdf(file_path)
+
+        if not pages:
+            st.error(
+                f"❌ No extractable text found in **{filename}**. "
+                "Is it a scanned / image-only PDF?"
+            )
+            return False
+
+        # 2. Chunk
+        with st.spinner(f"✂️ Chunking **{filename}** …"):
+            chunks = chunk_pages(
+                pages,
+                chunk_size=st.session_state.chunk_size,
+                chunk_overlap=st.session_state.chunk_overlap,
+            )
+
+        if not chunks:
+            st.error(f"❌ No usable chunks produced from **{filename}**.")
+            return False
+
+        # 3. Embed
+        with st.spinner(
+            f"🧠 Embedding **{filename}** ({len(chunks)} chunks) — "
+            "this may take a moment …"
+        ):
+            texts = [c["text"] for c in chunks]
+            embeddings = embed_documents(texts)
+
+        # 4. Index
+        with st.spinner(f"💾 Indexing **{filename}** …"):
+            st.session_state.store.add(embeddings, chunks)
+
+        # ── Record metadata ────────────────────────────────────────────────────
+        st.session_state.papers[filename] = {
+            "filename": filename,
+            "chunks": len(chunks),
+            "pages": pages[-1]["total_pages"] if pages else 0,
+            "hash": file_hash,
+            "indexed_at": datetime.now().strftime("%H:%M:%S"),
+        }
+        st.session_state.processed_hashes.add(file_hash)
+
+        st.success(
+            f"✅ **{filename}** indexed! "
+            f"({len(chunks)} chunks from {len(pages)} pages)"
+        )
+        return True
+
+    except Exception as exc:
+        st.error(f"❌ Error processing **{filename}**: {exc}")
+        logger.exception(f"Failed to process '{filename}'")
+        return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Sidebar
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _render_sidebar() -> None:
+    with st.sidebar:
+        st.title("📚 Research RAG")
+        st.caption("Upload papers, ask questions, compare findings.")
+        st.divider()
+
+        # ── Upload ────────────────────────────────────────────────────────────
+        st.subheader("Upload Papers")
+        uploaded_files = st.file_uploader(
+            "Drop PDF(s) here",
+            type=["pdf"],
+            accept_multiple_files=True,
+            label_visibility="collapsed",
+        )
+        if uploaded_files:
+            for f in uploaded_files:
+                _process_pdf(f)
+
+        # ── Loaded papers ─────────────────────────────────────────────────────
+        if st.session_state.papers:
+            st.divider()
+            st.subheader(f"Loaded Papers ({len(st.session_state.papers)})")
+            for fname, meta in st.session_state.papers.items():
+                with st.expander(f"📄 {fname}"):
+                    st.caption(
+                        f"Pages: {meta['pages']} | "
+                        f"Chunks: {meta['chunks']} | "
+                        f"Indexed: {meta['indexed_at']}"
+                    )
+
+        # ── Mode toggle ───────────────────────────────────────────────────────
+        st.divider()
+        st.subheader("Mode")
+        mode_choice = st.radio(
+            "Mode",
+            options=["💬 Chat", "⚖️ Compare Papers"],
+            label_visibility="collapsed",
+        )
+        st.session_state.mode = "chat" if "Chat" in mode_choice else "compare"
+
+        # ── Retrieval settings ────────────────────────────────────────────────
+        st.divider()
+        st.subheader("Settings")
+
+        with st.expander("Retrieval"):
+            st.session_state.top_k = st.slider(
+                "Top-K retrieve", min_value=3, max_value=20,
+                value=st.session_state.top_k,
+                help="Chunks fetched from FAISS before reranking.",
+            )
+            st.session_state.top_n = st.slider(
+                "Top-N rerank", min_value=1, max_value=10,
+                value=st.session_state.top_n,
+                help="Chunks kept after Cohere Rerank (sent to the LLM).",
+            )
+
+        with st.expander("Chunking (apply before uploading)"):
+            st.session_state.chunk_size = st.slider(
+                "Chunk size (chars)", 256, 1024,
+                value=st.session_state.chunk_size, step=64,
+            )
+            st.session_state.chunk_overlap = st.slider(
+                "Chunk overlap (chars)", 0, 256,
+                value=st.session_state.chunk_overlap, step=16,
+            )
+
+        with st.expander("Citation style"):
+            st.session_state.citation_style = st.selectbox(
+                "Style",
+                options=["APA", "IEEE"],
+                index=0,
+                label_visibility="collapsed",
+            )
+
+        # ── Save / load index ──────────────────────────────────────────────────
+        if st.session_state.papers:
+            st.divider()
+            st.subheader("Index Persistence")
+            col_save, col_load = st.columns(2)
+            with col_save:
+                if st.button("💾 Save Index", use_container_width=True):
+                    try:
+                        st.session_state.store.save(INDEX_DIR)
+                        st.success("Index saved.")
+                    except Exception as e:
+                        st.error(f"Save failed: {e}")
+            with col_load:
+                if st.button("📂 Load Index", use_container_width=True):
+                    try:
+                        st.session_state.store = FAISSVectorStore.load(INDEX_DIR)
+                        st.success(
+                            f"Loaded {st.session_state.store.total_chunks} chunks."
+                        )
+                    except FileNotFoundError:
+                        st.warning("No saved index found.")
+                    except Exception as e:
+                        st.error(f"Load failed: {e}")
+
+        # ── Quick-action shortcuts ────────────────────────────────────────────
+        if st.session_state.papers:
+            st.divider()
+            st.subheader("Quick Actions")
+            paper_names = list(st.session_state.papers.keys())
+            selected = st.selectbox(
+                "Paper for shortcuts",
+                paper_names,
+                label_visibility="collapsed",
+            )
+
+            q_col1, q_col2 = st.columns(2)
+            shortcuts = {
+                "📝 Summarize": (
+                    f"Summarize the paper '{selected}' covering its main "
+                    "contributions, methodology, and key results."
+                ),
+                "🎯 Contributions": (
+                    f"List the key contributions of the paper '{selected}'."
+                ),
+                "⚠️ Limitations": (
+                    f"What limitations are discussed in the paper '{selected}'?"
+                ),
+                "🔬 Methodology": (
+                    f"Describe the methodology used in the paper '{selected}'."
+                ),
+            }
+            for i, (label, query_text) in enumerate(shortcuts.items()):
+                col = q_col1 if i % 2 == 0 else q_col2
+                if col.button(label, use_container_width=True):
+                    st.session_state["_shortcut_query"] = query_text
+
+        # ── Reset ─────────────────────────────────────────────────────────────
+        st.divider()
+        if st.button(
+            "🔄 Reset Session",
+            type="secondary",
+            use_container_width=True,
+            help="Clear all loaded papers, chat history, and the vector index.",
+        ):
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Chat interface
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _render_chat() -> None:
+    st.header("💬 Ask Your Papers")
+
+    if not st.session_state.papers:
+        st.info(
+            "👈 **Upload one or more research PDFs** in the sidebar to get started."
+        )
+        return
+
+    # ── Replay history ─────────────────────────────────────────────────────────
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+            if msg["role"] == "assistant":
+                if msg.get("citations"):
+                    with st.expander("📎 Citations & Sources"):
+                        st.markdown(msg["citations"])
+                        st.divider()
+                        _render_formatted_citations(msg.get("used_chunks", []))
+                if msg.get("snippets"):
+                    with st.expander("🔍 Retrieved Snippets"):
+                        st.markdown(msg["snippets"])
+
+    # ── Input ──────────────────────────────────────────────────────────────────
+    shortcut = st.session_state.pop("_shortcut_query", None)
+    user_input: Optional[str] = st.chat_input(
+        "Ask a question about the uploaded papers …"
+    )
+    query: Optional[str] = shortcut or user_input
+
+    if not query:
+        return
+
+    # ── Display user message ───────────────────────────────────────────────────
+    st.session_state.messages.append({"role": "user", "content": query})
+    with st.chat_message("user"):
+        st.markdown(query)
+
+    # Build condensed history for the LLM (no metadata fields)
+    history = [
+        {"role": m["role"], "content": m["content"]}
+        for m in st.session_state.messages[:-1]
+    ]
+
+    # ── Pipeline ───────────────────────────────────────────────────────────────
+    with st.chat_message("assistant"):
+        with st.spinner("🔍 Retrieving relevant passages …"):
+            raw_chunks = retrieve(
+                query, st.session_state.store, top_k=st.session_state.top_k
+            )
+
+        if not raw_chunks:
+            answer = (
+                "I could not find any relevant content in the indexed papers. "
+                "Try uploading additional papers or rephrasing your question."
+            )
+            st.markdown(answer)
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+            return
+
+        with st.spinner("⚡ Reranking passages …"):
+            reranked = rerank(query, raw_chunks, top_n=st.session_state.top_n)
+
+        with st.spinner("🤖 Generating answer …"):
+            answer, used_chunks = generate_answer(
+                query, reranked, chat_history=history
+            )
+
+        st.markdown(answer)
+
+        citations_text = format_citations(used_chunks)
+        snippets_text = format_source_snippets(used_chunks)
+
+        with st.expander("📎 Citations & Sources"):
+            st.markdown(citations_text)
+            st.divider()
+            _render_formatted_citations(used_chunks)
+
+        if snippets_text:
+            with st.expander("🔍 Retrieved Snippets"):
+                st.markdown(snippets_text)
+
+    # ── Persist to history ─────────────────────────────────────────────────────
+    st.session_state.messages.append(
+        {
+            "role": "assistant",
+            "content": answer,
+            "citations": citations_text,
+            "snippets": snippets_text,
+            "used_chunks": used_chunks,
+        }
+    )
+
+
+def _render_formatted_citations(chunks: List[Dict[str, Any]]) -> None:
+    """Render APA or IEEE formatted citations inside an expander."""
+    if not chunks:
+        return
+
+    style = st.session_state.citation_style
+    st.caption(f"Export format ({style}):")
+    seen: set = set()
+    idx = 1
+    for chunk in chunks:
+        key = (chunk["filename"], chunk["page_number"])
+        if key in seen:
+            continue
+        seen.add(key)
+        if style == "APA":
+            st.code(build_apa_citation(chunk["filename"], chunk["page_number"]))
+        else:
+            st.code(build_ieee_citation(chunk["filename"], chunk["page_number"], idx))
+        idx += 1
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Compare interface
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _render_compare() -> None:
+    st.header("⚖️ Compare Two Papers")
+
+    papers = list(st.session_state.papers.keys())
+
+    if len(papers) < 2:
+        st.info(
+            "Please upload **at least 2 papers** in the sidebar "
+            "to use comparison mode."
+        )
+        return
+
+    # ── Paper selection ────────────────────────────────────────────────────────
+    col_a, col_b = st.columns(2)
+    with col_a:
+        paper_a = st.selectbox("Paper A", papers, key="cmp_a")
+    with col_b:
+        remaining = [p for p in papers if p != paper_a]
+        paper_b = st.selectbox("Paper B", remaining, key="cmp_b")
+
+    st.divider()
+
+    # ── Quick comparison buttons ───────────────────────────────────────────────
+    st.subheader("Quick Comparisons")
+    quick = {
+        "Methodology": "How do the methodologies of the two papers differ?",
+        "Results":     "Compare the results and findings of the two papers.",
+        "Limitations": "What are the limitations identified in each paper?",
+        "Contributions": "What are the unique contributions of each paper?",
+    }
+    btn_cols = st.columns(len(quick))
+    selected_quick: Optional[str] = None
+    for col, (label, q_text) in zip(btn_cols, quick.items()):
+        if col.button(label, use_container_width=True):
+            selected_quick = q_text
+
+    st.divider()
+
+    # ── Custom question ────────────────────────────────────────────────────────
+    compare_query = st.text_area(
+        "Custom comparison question:",
+        value=selected_quick or "",
+        placeholder="e.g. How do the two papers address class imbalance?",
+        height=80,
+    )
+
+    run_btn = st.button(
+        "⚖️ Compare Now", type="primary", use_container_width=True,
+        disabled=not compare_query.strip(),
+    )
+
+    if not run_btn or not compare_query.strip():
+        return
+
+    # ── Run comparison ─────────────────────────────────────────────────────────
+    with st.spinner("🔍 Running comparison pipeline …"):
+        answer, chunks_a, chunks_b = compare_papers(
+            query=compare_query,
+            paper_a=paper_a,
+            paper_b=paper_b,
+            store=st.session_state.store,
+            top_k=st.session_state.top_k,
+            top_n=st.session_state.top_n,
+        )
+
+    st.divider()
+    st.subheader("Comparison Result")
+    st.markdown(answer)
+
+    # ── Per-paper sources ──────────────────────────────────────────────────────
+    if chunks_a or chunks_b:
+        src_a, src_b = st.columns(2)
+        with src_a:
+            st.subheader(f"Sources — {paper_a}")
+            if chunks_a:
+                st.markdown(format_source_snippets(chunks_a))
+            else:
+                st.caption("No relevant content found in Paper A.")
+        with src_b:
+            st.subheader(f"Sources — {paper_b}")
+            if chunks_b:
+                st.markdown(format_source_snippets(chunks_b))
+            else:
+                st.caption("No relevant content found in Paper B.")
+
+    # ── Log to history for export ──────────────────────────────────────────────
+    st.session_state.messages.extend(
+        [
+            {
+                "role": "user",
+                "content": f"[COMPARE] {paper_a} vs {paper_b}: {compare_query}",
+            },
+            {"role": "assistant", "content": answer},
+        ]
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Export
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _render_export() -> None:
+    """Render download buttons for the current session's content."""
+    if not st.session_state.messages:
+        return
+
+    st.divider()
+    st.subheader("📥 Export Session")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    col_md, col_json = st.columns(2)
+
+    # ── Markdown export ────────────────────────────────────────────────────────
+    with col_md:
+        md_lines = [
+            f"# {APP_TITLE} — Session Export",
+            f"*Exported: {datetime.now().strftime('%Y-%m-%d %H:%M')}*",
+            "",
+        ]
+        for msg in st.session_state.messages:
+            role_label = "**You**" if msg["role"] == "user" else "**Assistant**"
+            md_lines.append(f"### {role_label}")
+            md_lines.append(msg["content"])
+            if msg.get("citations"):
+                md_lines.append(f"\n*{msg['citations']}*")
+            md_lines.append("")
+
+        st.download_button(
+            label="📄 Download Chat (Markdown)",
+            data="\n".join(md_lines),
+            file_name=f"research_chat_{timestamp}.md",
+            mime="text/markdown",
+            use_container_width=True,
+        )
+
+    # ── JSON export ────────────────────────────────────────────────────────────
+    with col_json:
+        summary = {
+            "exported_at": datetime.now().isoformat(),
+            "papers": list(st.session_state.papers.keys()),
+            "message_count": len(st.session_state.messages),
+            "messages": [
+                {"role": m["role"], "content": m["content"]}
+                for m in st.session_state.messages
+            ],
+        }
+        st.download_button(
+            label="📊 Download Summary (JSON)",
+            data=json.dumps(summary, indent=2, ensure_ascii=False),
+            file_name=f"research_summary_{timestamp}.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Main
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main() -> None:
+    _render_sidebar()
+
+    if not _check_api_keys():
+        return
+
+    if st.session_state.mode == "chat":
+        _render_chat()
+    else:
+        _render_compare()
+
+    _render_export()
+
+
+if __name__ == "__main__":
+    main()
