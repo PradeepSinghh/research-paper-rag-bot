@@ -8,7 +8,8 @@ A production-quality, lightweight Retrieval-Augmented Generation (RAG) chatbot t
 
 ---
 ## Screenshots
-![alt text](image.png)
+<img width="2928" height="1628" alt="image" src="https://github.com/user-attachments/assets/a58ef5a9-824f-4a47-bb9c-2b0e5143f558" />
+
 
 ---
 ## Tech Stack
